@@ -18,43 +18,42 @@ interface PlayerState {
   theme: Theme;
 }
 
+declare global {
+  interface Window {
+    Telegram?: {
+      WebApp: any;
+    };
+  }
+}
+
 const GRID_SIZE = 20;
 const INITIAL_SNAKE = [{ x: 10, y: 10 }, { x: 10, y: 11 }, { x: 10, y: 12 }];
 
+const defaultState: PlayerState = {
+  level: 1,
+  xp: 0,
+  bytes: 0,
+  baseSpeed: 160,
+  hasShield: false,
+  hasWarpDrive: false,
+  multiplier: 1,
+  theme: 'green'
+};
+
+const validateAndMergeState = (parsed: any): PlayerState => ({
+  ...defaultState,
+  ...parsed,
+  bytes: isNaN(parsed.bytes) || parsed.bytes === null ? 0 : parsed.bytes,
+  multiplier: isNaN(parsed.multiplier) || parsed.multiplier === null ? 1 : parsed.multiplier,
+  baseSpeed: isNaN(parsed.baseSpeed) || parsed.baseSpeed === null ? 160 : parsed.baseSpeed,
+  xp: isNaN(parsed.xp) || parsed.xp === null ? 0 : parsed.xp,
+  level: isNaN(parsed.level) || parsed.level === null ? 1 : parsed.level,
+});
+
 export default function App() {
   // --- State ---
-  const [player, setPlayer] = useState<PlayerState>(() => {
-    const defaultState: PlayerState = {
-      level: 1,
-      xp: 0,
-      bytes: 0,
-      baseSpeed: 160,
-      hasShield: false,
-      hasWarpDrive: false,
-      multiplier: 1,
-      theme: 'green'
-    };
-
-    const saved = localStorage.getItem('snake_rpg_player_v3');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return {
-          ...defaultState,
-          ...parsed,
-          // Fix corrupted NaN values if they exist
-          bytes: isNaN(parsed.bytes) || parsed.bytes === null ? 0 : parsed.bytes,
-          multiplier: isNaN(parsed.multiplier) || parsed.multiplier === null ? 1 : parsed.multiplier,
-          baseSpeed: isNaN(parsed.baseSpeed) || parsed.baseSpeed === null ? 160 : parsed.baseSpeed,
-          xp: isNaN(parsed.xp) || parsed.xp === null ? 0 : parsed.xp,
-          level: isNaN(parsed.level) || parsed.level === null ? 1 : parsed.level,
-        };
-      } catch (e) {
-        return defaultState;
-      }
-    }
-    return defaultState;
-  });
+  const [isDataLoading, setIsDataLoading] = useState(true);
+  const [player, setPlayer] = useState<PlayerState>(defaultState);
 
   const [isRunning, setIsRunning] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -84,10 +83,54 @@ export default function App() {
 
   // --- Persistence & Sync ---
   useEffect(() => {
-    localStorage.setItem('snake_rpg_player_v3', JSON.stringify(player));
+    const tg = window.Telegram?.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+    }
+
+    const loadFromLocal = () => {
+      const saved = localStorage.getItem('snake_rpg_player_v3');
+      if (saved) {
+        try {
+          setPlayer(validateAndMergeState(JSON.parse(saved)));
+        } catch (e) {}
+      }
+      setIsDataLoading(false);
+    };
+
+    if (tg?.CloudStorage) {
+      tg.CloudStorage.getItem('snake_rpg_player_v3', (err: any, saved: string) => {
+        if (!err && saved) {
+          try {
+            setPlayer(validateAndMergeState(JSON.parse(saved)));
+            setIsDataLoading(false);
+          } catch (e) {
+            loadFromLocal();
+          }
+        } else {
+          loadFromLocal();
+        }
+      });
+    } else {
+      loadFromLocal();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isDataLoading) return;
+    
+    const dataStr = JSON.stringify(player);
+    localStorage.setItem('snake_rpg_player_v3', dataStr);
+    
+    const tg = window.Telegram?.WebApp;
+    if (tg?.CloudStorage) {
+      tg.CloudStorage.setItem('snake_rpg_player_v3', dataStr);
+    }
+
     document.documentElement.setAttribute('data-theme', player.theme);
     playerRef.current = player;
-  }, [player]);
+  }, [player, isDataLoading]);
 
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
   useEffect(() => { isPausedRef.current = isPaused; }, [isPaused]);
@@ -510,6 +553,15 @@ export default function App() {
       setEasterEggClicks(0);
     }
   };
+
+  if (isDataLoading) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen p-4 select-none relative">
+        <Terminal size={48} className="mb-4 animate-pulse text-[var(--color-primary)]" />
+        <p className="tracking-widest uppercase text-sm text-[var(--color-primary)]">Syncing with Telegram Cloud...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-4 select-none relative">
