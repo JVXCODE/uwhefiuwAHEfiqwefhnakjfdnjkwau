@@ -1,8 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
-import { Shield, Zap, Terminal, ShoppingCart, Play, RefreshCcw, Palette, Pause, Home, Cpu, Rocket, Star } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Shield, Zap, Terminal, ShoppingCart, Play, RefreshCcw, Palette, Pause, Home, Cpu, Rocket, Star, Flame } from 'lucide-react';
 
-// --- Types ---
+// --- Types & Constants ---
 type Point = { x: number; y: number };
 type Theme = 'green' | 'red' | 'blue' | 'pink' | 'purple' | 'matrix';
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; maxLife: number; color: string; size: number };
@@ -14,12 +13,28 @@ interface PlayerState {
   baseSpeed: number;
   hasShield: boolean;
   hasWarpDrive: boolean;
+  hasFirewallBypass: boolean;
   multiplier: number;
   theme: Theme;
 }
 
 const GRID_SIZE = 20;
-const INITIAL_SNAKE = [{ x: 10, y: 10 }, { x: 10, y: 11 }, { x: 10, y: 12 }];
+const CANVAS_SIZE = 400;
+
+const THEME_COLORS: Record<Theme, string> = {
+  green: '#00ff41',
+  red: '#ff3131',
+  blue: '#3182ff',
+  pink: '#ff31f6',
+  purple: '#9b31ff',
+  matrix: '#00ff00'
+};
+
+const safeNum = (val: any, fallback: number) => {
+  if (val === null || val === undefined) return fallback;
+  const n = Number(val);
+  return Number.isFinite(n) && !isNaN(n) ? n : fallback;
+};
 
 export default function App() {
   // --- State ---
@@ -31,23 +46,26 @@ export default function App() {
       baseSpeed: 160,
       hasShield: false,
       hasWarpDrive: false,
+      hasFirewallBypass: false,
       multiplier: 1,
       theme: 'green'
     };
 
-    const saved = localStorage.getItem('snake_rpg_player_v3');
+    // Migrate from v3 or load v4, with strict NaN protection
+    const saved = localStorage.getItem('snake_rpg_player_v4') || localStorage.getItem('snake_rpg_player_v3');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
         return {
-          ...defaultState,
-          ...parsed,
-          // Fix corrupted NaN values if they exist
-          bytes: isNaN(parsed.bytes) || parsed.bytes === null ? 0 : parsed.bytes,
-          multiplier: isNaN(parsed.multiplier) || parsed.multiplier === null ? 1 : parsed.multiplier,
-          baseSpeed: isNaN(parsed.baseSpeed) || parsed.baseSpeed === null ? 160 : parsed.baseSpeed,
-          xp: isNaN(parsed.xp) || parsed.xp === null ? 0 : parsed.xp,
-          level: isNaN(parsed.level) || parsed.level === null ? 1 : parsed.level,
+          level: safeNum(parsed.level, 1),
+          xp: safeNum(parsed.xp, 0),
+          bytes: safeNum(parsed.bytes, 0),
+          baseSpeed: safeNum(parsed.baseSpeed, 160),
+          hasShield: !!parsed.hasShield,
+          hasWarpDrive: !!parsed.hasWarpDrive,
+          hasFirewallBypass: !!parsed.hasFirewallBypass,
+          multiplier: safeNum(parsed.multiplier, 1),
+          theme: parsed.theme || 'green'
         };
       } catch (e) {
         return defaultState;
@@ -58,72 +76,62 @@ export default function App() {
 
   const [isRunning, setIsRunning] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
-  const [isMenuOpen, setIsMenuOpen] = useState(true);
-  const [gameOverReason, setGameOverReason] = useState<string | null>(null);
-  const [canvasSize, setCanvasSize] = useState({ width: 400, height: 400 });
-  const [tileCount, setTileCount] = useState({ x: 20, y: 20 });
-  const [easterEggClicks, setEasterEggClicks] = useState(0);
+  const [gameOverMsg, setGameOverMsg] = useState<string | null>(null);
+  const [showShop, setShowShop] = useState(false);
+  const [titleClicks, setTitleClicks] = useState(0);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   // --- Refs for Game Loop ---
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const snakeRef = useRef<Point[]>(INITIAL_SNAKE);
-  const directionRef = useRef<Point>({ x: 0, y: -1 });
-  const nextDirectionRef = useRef<Point>({ x: 0, y: -1 });
-  const dataNodeRef = useRef<Point>({ x: 5, y: 5 });
+  const snakeRef = useRef<Point[]>([{ x: 10, y: 10 }]);
+  const directionRef = useRef<Point>({ x: 0, y: 0 });
+  const nextDirectionRef = useRef<Point>({ x: 0, y: 0 });
+  const dataNodeRef = useRef<Point>({ x: 15, y: 10 });
   const goldenNodeRef = useRef<{ x: number; y: number; timer: number } | null>(null);
+  const glitchNodeRef = useRef<{ x: number; y: number; timer: number } | null>(null);
   const firewallsRef = useRef<Point[]>([]);
   const particlesRef = useRef<Particle[]>([]);
-  const gameLoopRef = useRef<number | null>(null);
-  const renderLoopRef = useRef<number | null>(null);
-  const speedRef = useRef<number>(player.baseSpeed);
-  
-  // Refs to access latest state in loops without rebinding
-  const playerRef = useRef(player);
-  const isRunningRef = useRef(isRunning);
-  const isPausedRef = useRef(isPaused);
+  const loopRef = useRef<number>();
+  const lastTickRef = useRef<number>(0);
+  const playerRef = useRef(player); // Keep ref synced for game loop
 
-  // --- Persistence & Sync ---
+  const tileCount = { x: CANVAS_SIZE / GRID_SIZE, y: CANVAS_SIZE / GRID_SIZE };
+
+  // Sync player state to ref and localStorage
   useEffect(() => {
-    localStorage.setItem('snake_rpg_player_v3', JSON.stringify(player));
-    document.documentElement.setAttribute('data-theme', player.theme);
     playerRef.current = player;
+    localStorage.setItem('snake_rpg_player_v4', JSON.stringify(player));
+    document.documentElement.setAttribute('data-theme', player.theme);
   }, [player]);
 
-  useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
-  useEffect(() => { isPausedRef.current = isPaused; }, [isPaused]);
-
-  // --- Initialization & Resize ---
-  const handleResize = useCallback(() => {
-    const maxSize = Math.min(window.innerWidth - 40, 400);
-    const tilesX = Math.floor(maxSize / GRID_SIZE);
-    const tilesY = Math.floor(maxSize / GRID_SIZE);
-    setCanvasSize({ width: tilesX * GRID_SIZE, height: tilesY * GRID_SIZE });
-    setTileCount({ x: tilesX, y: tilesY });
-  }, []);
-
-  useEffect(() => {
-    handleResize();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [handleResize]);
-
-  // --- Game Logic ---
-  const spawnParticles = useCallback((x: number, y: number, color: string, count: number) => {
-    const newParticles: Particle[] = [];
+  // --- Game Mechanics ---
+  const spawnParticles = (x: number, y: number, color: string, count: number = 10) => {
     for (let i = 0; i < count; i++) {
-      newParticles.push({
+      particlesRef.current.push({
         x: x * GRID_SIZE + GRID_SIZE / 2,
         y: y * GRID_SIZE + GRID_SIZE / 2,
-        vx: (Math.random() - 0.5) * 12,
-        vy: (Math.random() - 0.5) * 12,
+        vx: (Math.random() - 0.5) * 8,
+        vy: (Math.random() - 0.5) * 8,
         life: 0,
-        maxLife: 20 + Math.random() * 30,
+        maxLife: 20 + Math.random() * 20,
         color,
         size: Math.random() * 4 + 2
       });
     }
-    particlesRef.current.push(...newParticles);
-  }, []);
+  };
+
+  const spawnFirewalls = useCallback((levelOverride?: number) => {
+    const lvl = levelOverride !== undefined ? levelOverride : playerRef.current.level;
+    const count = Math.min(Math.floor(lvl / 2), 15);
+    const newFirewalls: Point[] = [];
+    for (let i = 0; i < count; i++) {
+      newFirewalls.push({
+        x: Math.floor(Math.random() * tileCount.x),
+        y: Math.floor(Math.random() * tileCount.y)
+      });
+    }
+    firewallsRef.current = newFirewalls;
+  }, [tileCount]);
 
   const spawnDataNode = useCallback(() => {
     let newX = 0, newY = 0;
@@ -137,7 +145,7 @@ export default function App() {
     }
     dataNodeRef.current = { x: newX, y: newY };
 
-    // 10% chance for golden node
+    // 10% chance for Golden Node
     if (Math.random() < 0.1 && !goldenNodeRef.current) {
       let gx = 0, gy = 0;
       let gValid = false;
@@ -149,35 +157,25 @@ export default function App() {
         const onData = gx === newX && gy === newY;
         if (!onSnake && !onFirewall && !onData) gValid = true;
       }
-      goldenNodeRef.current = { x: gx, y: gy, timer: 60 }; // 60 ticks
+      goldenNodeRef.current = { x: gx, y: gy, timer: 50 }; // 50 ticks to collect
     }
-  }, [tileCount]);
 
-  const spawnFirewalls = useCallback(() => {
-    const count = Math.min(Math.floor(playerRef.current.level / 2), 15); // Max 15 firewalls
-    const newFirewalls: Point[] = [];
-    for (let i = 0; i < count; i++) {
-      let fx = 0, fy = 0;
-      let valid = false;
-      while (!valid) {
-        fx = Math.floor(Math.random() * tileCount.x);
-        fy = Math.floor(Math.random() * tileCount.y);
-        const onSnake = snakeRef.current.some(p => p.x === fx && p.y === fy);
-        const onData = dataNodeRef.current.x === fx && dataNodeRef.current.y === fy;
-        const nearCenter = Math.abs(fx - 10) < 4 && Math.abs(fy - 10) < 4;
-        if (!onSnake && !onData && !nearCenter) valid = true;
+    // 5% chance for Glitch Node
+    if (Math.random() < 0.05 && !glitchNodeRef.current) {
+      let gx = 0, gy = 0;
+      let gValid = false;
+      while (!gValid) {
+        gx = Math.floor(Math.random() * tileCount.x);
+        gy = Math.floor(Math.random() * tileCount.y);
+        const onSnake = snakeRef.current.some(p => p.x === gx && p.y === gy);
+        const onFirewall = firewallsRef.current.some(p => p.x === gx && p.y === gy);
+        const onData = gx === newX && gy === newY;
+        const onGolden = goldenNodeRef.current && goldenNodeRef.current.x === gx && goldenNodeRef.current.y === gy;
+        if (!onSnake && !onFirewall && !onData && !onGolden) gValid = true;
       }
-      newFirewalls.push({ x: fx, y: fy });
+      glitchNodeRef.current = { x: gx, y: gy, timer: 80 };
     }
-    firewallsRef.current = newFirewalls;
   }, [tileCount]);
-
-  const gameOver = useCallback((reason: string) => {
-    setIsRunning(false);
-    setGameOverReason(reason);
-    setIsMenuOpen(true);
-    if (gameLoopRef.current) clearInterval(gameLoopRef.current);
-  }, []);
 
   const addXP = useCallback((amount: number) => {
     setPlayer(prev => {
@@ -190,497 +188,596 @@ export default function App() {
         newXP -= xpToNext;
         newLevel++;
         newBytes += 50; // Level up bonus
-        spawnFirewalls(); // Update firewalls on level up
+        spawnFirewalls(newLevel);
+        spawnParticles(snakeRef.current[0].x, snakeRef.current[0].y, '#ffffff', 30);
       }
 
       return { ...prev, xp: newXP, level: newLevel, bytes: newBytes };
     });
   }, [spawnFirewalls]);
 
-  const gameTick = useCallback(() => {
-    if (isPausedRef.current || !isRunningRef.current) return;
+  const gameOver = (msg: string) => {
+    setIsRunning(false);
+    setGameOverMsg(msg);
+  };
 
-    directionRef.current = nextDirectionRef.current;
-    const { x: dx, y: dy } = directionRef.current;
-
-    if (dx === 0 && dy === 0) return; // Paused by shield hit
-
-    let headX = snakeRef.current[0].x + dx;
-    let headY = snakeRef.current[0].y + dy;
-
-    // Warp Drive Mechanic
-    if (playerRef.current.hasWarpDrive) {
-      if (headX < 0) headX = tileCount.x - 1;
-      if (headX >= tileCount.x) headX = 0;
-      if (headY < 0) headY = tileCount.y - 1;
-      if (headY >= tileCount.y) headY = 0;
+  const gameTick = useCallback((time: number) => {
+    if (!isRunning || isPaused) {
+      lastTickRef.current = time;
+      loopRef.current = requestAnimationFrame(gameTick);
+      return;
     }
 
-    const head = { x: headX, y: headY };
+    const currentSpeed = Math.max(50, playerRef.current.baseSpeed - (playerRef.current.level * 2));
+    
+    if (time - lastTickRef.current > currentSpeed) {
+      lastTickRef.current = time;
 
-    // Collision Check
-    let hit = false;
-    if (head.x < 0 || head.x >= tileCount.x || head.y < 0 || head.y >= tileCount.y) hit = true;
-    if (snakeRef.current.some(p => p.x === head.x && p.y === head.y)) hit = true;
-    if (firewallsRef.current.some(p => p.x === head.x && p.y === head.y)) hit = true;
+      directionRef.current = nextDirectionRef.current;
+      const dir = directionRef.current;
 
-    if (hit) {
-      if (playerRef.current.hasShield) {
-        // One-time shield consumption
-        setPlayer(prev => ({ ...prev, hasShield: false }));
-        playerRef.current.hasShield = false;
-        
-        spawnParticles(head.x, head.y, '#60a5fa', 40); // Shield break effect
-        
-        nextDirectionRef.current = { x: 0, y: 0 }; // Pause movement
-        directionRef.current = { x: 0, y: 0 };
-        return;
-      } else {
-        // Screen shake effect
-        const container = document.getElementById('game-container');
-        if (container) {
-          container.classList.add('shake');
-          setTimeout(() => container.classList.remove('shake'), 500);
+      // Only move if we have a direction
+      if (dir.x !== 0 || dir.y !== 0) {
+        const newSnake = [...snakeRef.current];
+        let headX = newSnake[0].x + dir.x;
+        let headY = newSnake[0].y + dir.y;
+
+        // Warp Drive Logic
+        let usedWarp = false;
+        let originalHeadX = headX;
+        let originalHeadY = headY;
+
+        if (headX < 0) { headX = tileCount.x - 1; usedWarp = true; }
+        else if (headX >= tileCount.x) { headX = 0; usedWarp = true; }
+        else if (headY < 0) { headY = tileCount.y - 1; usedWarp = true; }
+        else if (headY >= tileCount.y) { headY = 0; usedWarp = true; }
+
+        if (usedWarp) {
+          if (playerRef.current.hasWarpDrive) {
+            setPlayer(prev => ({ ...prev, hasWarpDrive: false }));
+            playerRef.current.hasWarpDrive = false;
+            spawnParticles(headX, headY, '#a855f7', 30);
+          } else {
+            // Revert headX/Y to trigger wall collision
+            headX = originalHeadX;
+            headY = originalHeadY;
+          }
         }
-        gameOver("SYSTEM_CRITICAL_FAILURE");
-        return;
+
+        const head = { x: headX, y: headY };
+
+        // Collision Check
+        let hit = false;
+        
+        // Walls
+        if (head.x < 0 || head.x >= tileCount.x || head.y < 0 || head.y >= tileCount.y) hit = true;
+        // Self
+        if (newSnake.some(p => p.x === head.x && p.y === head.y)) hit = true;
+        
+        // Firewalls
+        const fwIndex = firewallsRef.current.findIndex(p => p.x === head.x && p.y === head.y);
+        if (fwIndex !== -1) {
+          if (playerRef.current.hasFirewallBypass) {
+            // Eat firewall
+            firewallsRef.current.splice(fwIndex, 1);
+            setPlayer(prev => ({ ...prev, bytes: Number(prev.bytes) + (20 * prev.multiplier), hasFirewallBypass: false }));
+            playerRef.current.hasFirewallBypass = false;
+            spawnParticles(head.x, head.y, '#ff3131', 20);
+          } else {
+            hit = true;
+          }
+        }
+
+        if (hit) {
+          if (playerRef.current.hasShield) {
+            setPlayer(prev => ({ ...prev, hasShield: false }));
+            playerRef.current.hasShield = false;
+            spawnParticles(head.x, head.y, '#60a5fa', 40);
+            // Bounce back
+            nextDirectionRef.current = { x: 0, y: 0 };
+            directionRef.current = { x: 0, y: 0 };
+            loopRef.current = requestAnimationFrame(gameTick);
+            return;
+          } else {
+            // Lose items on death
+            setPlayer(prev => ({ ...prev, hasWarpDrive: false, hasFirewallBypass: false }));
+            
+            const container = document.getElementById('game-container');
+            if (container) {
+              container.classList.add('shake');
+              setTimeout(() => container.classList.remove('shake'), 500);
+            }
+            gameOver("SYSTEM_CRITICAL_FAILURE");
+            return;
+          }
+        }
+
+        newSnake.unshift(head);
+
+        let ate = false;
+
+        // Eat Data Node
+        if (head.x === dataNodeRef.current.x && head.y === dataNodeRef.current.y) {
+          spawnParticles(head.x, head.y, 'var(--theme-color)', 15);
+          setPlayer(prev => ({ ...prev, bytes: prev.bytes + (10 * prev.multiplier) }));
+          addXP(20);
+          spawnDataNode();
+          ate = true;
+        }
+
+        // Eat Golden Node
+        if (goldenNodeRef.current && head.x === goldenNodeRef.current.x && head.y === goldenNodeRef.current.y) {
+          spawnParticles(head.x, head.y, '#fbbf24', 30);
+          setPlayer(prev => ({ ...prev, bytes: prev.bytes + (50 * prev.multiplier) }));
+          addXP(50);
+          goldenNodeRef.current = null;
+          ate = true;
+        }
+
+        // Eat Glitch Node
+        if (glitchNodeRef.current && head.x === glitchNodeRef.current.x && head.y === glitchNodeRef.current.y) {
+          spawnParticles(head.x, head.y, '#ff00ff', 40);
+          setPlayer(prev => ({ ...prev, bytes: prev.bytes + (100 * prev.multiplier) }));
+          addXP(100);
+          glitchNodeRef.current = null;
+          ate = true;
+          spawnFirewalls(); // Randomize firewalls
+          const container = document.getElementById('game-container');
+          if (container) {
+            container.classList.add('glitch-anim');
+            setTimeout(() => container.classList.remove('glitch-anim'), 300);
+          }
+        }
+
+        if (!ate) {
+          newSnake.pop();
+        }
+
+        snakeRef.current = newSnake;
+
+        // Update Timers
+        if (goldenNodeRef.current) {
+          goldenNodeRef.current.timer--;
+          if (goldenNodeRef.current.timer <= 0) goldenNodeRef.current = null;
+        }
+        if (glitchNodeRef.current) {
+          glitchNodeRef.current.timer--;
+          if (glitchNodeRef.current.timer <= 0) glitchNodeRef.current = null;
+        }
       }
     }
 
-    const newSnake = [head, ...snakeRef.current];
-    let ate = false;
+    // Render
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 
-    // Eat Data Node
-    if (head.x === dataNodeRef.current.x && head.y === dataNodeRef.current.y) {
-      const primaryColor = getComputedStyle(document.documentElement).getPropertyValue('--color-primary').trim();
-      spawnParticles(head.x, head.y, primaryColor, 15);
-      
-      setPlayer(prev => ({ ...prev, bytes: prev.bytes + (10 * prev.multiplier) }));
-      addXP(20);
-      spawnDataNode();
-      ate = true;
-      
-      speedRef.current = Math.max(80, speedRef.current - 1);
-      if (gameLoopRef.current) {
-        clearInterval(gameLoopRef.current);
-        gameLoopRef.current = window.setInterval(gameTick, speedRef.current);
+        // Draw Grid
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+        ctx.lineWidth = 1;
+        for (let i = 0; i <= CANVAS_SIZE; i += GRID_SIZE) {
+          ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, CANVAS_SIZE); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(CANVAS_SIZE, i); ctx.stroke();
+        }
+
+        // Draw Firewalls
+        const fwColor = playerRef.current.theme === 'red' ? '#f97316' : '#ff3131';
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = fwColor;
+        firewallsRef.current.forEach(fw => {
+          ctx.fillStyle = fwColor;
+          ctx.fillRect(fw.x * GRID_SIZE + 2, fw.y * GRID_SIZE + 2, GRID_SIZE - 4, GRID_SIZE - 4);
+          // Add a dark center to make firewalls look like hollow blocks/barriers
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(fw.x * GRID_SIZE + 6, fw.y * GRID_SIZE + 6, GRID_SIZE - 12, GRID_SIZE - 12);
+        });
+
+        // Draw Data Node
+        ctx.fillStyle = 'var(--theme-color)';
+        ctx.shadowColor = 'var(--theme-color)';
+        ctx.fillRect(dataNodeRef.current.x * GRID_SIZE + 4, dataNodeRef.current.y * GRID_SIZE + 4, GRID_SIZE - 8, GRID_SIZE - 8);
+
+        // Draw Golden Node
+        if (goldenNodeRef.current) {
+          ctx.fillStyle = '#fbbf24';
+          ctx.shadowColor = '#fbbf24';
+          const size = GRID_SIZE - 6 + Math.sin(time / 100) * 2;
+          const offset = (GRID_SIZE - size) / 2;
+          ctx.fillRect(goldenNodeRef.current.x * GRID_SIZE + offset, goldenNodeRef.current.y * GRID_SIZE + offset, size, size);
+        }
+
+        // Draw Glitch Node
+        if (glitchNodeRef.current) {
+          ctx.fillStyle = Math.random() > 0.5 ? "#ff00ff" : "#00ffff";
+          ctx.shadowColor = ctx.fillStyle;
+          const xOff = (Math.random() - 0.5) * 4;
+          const yOff = (Math.random() - 0.5) * 4;
+          ctx.fillRect(
+            glitchNodeRef.current.x * GRID_SIZE + 4 + xOff,
+            glitchNodeRef.current.y * GRID_SIZE + 4 + yOff,
+            GRID_SIZE - 8,
+            GRID_SIZE - 8
+          );
+        }
+
+        // Draw Snake
+        ctx.shadowBlur = 15;
+        snakeRef.current.forEach((segment, index) => {
+          ctx.fillStyle = index === 0 ? '#ffffff' : 'var(--theme-color)';
+          ctx.shadowColor = index === 0 ? '#ffffff' : 'var(--theme-color)';
+          ctx.globalAlpha = 1 - (index / snakeRef.current.length) * 0.5;
+          ctx.fillRect(segment.x * GRID_SIZE + 1, segment.y * GRID_SIZE + 1, GRID_SIZE - 2, GRID_SIZE - 2);
+        });
+        ctx.globalAlpha = 1;
+
+        // Draw Particles
+        ctx.shadowBlur = 5;
+        for (let i = particlesRef.current.length - 1; i >= 0; i--) {
+          const p = particlesRef.current[i];
+          p.x += p.vx;
+          p.y += p.vy;
+          p.life++;
+          
+          ctx.fillStyle = p.color;
+          ctx.shadowColor = p.color;
+          ctx.globalAlpha = 1 - (p.life / p.maxLife);
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          ctx.fill();
+
+          if (p.life >= p.maxLife) {
+            particlesRef.current.splice(i, 1);
+          }
+        }
+        ctx.globalAlpha = 1;
       }
     }
 
-    // Eat Golden Node
-    if (goldenNodeRef.current && head.x === goldenNodeRef.current.x && head.y === goldenNodeRef.current.y) {
-      spawnParticles(head.x, head.y, '#fbbf24', 30);
-      setPlayer(prev => ({ ...prev, bytes: prev.bytes + (50 * prev.multiplier) }));
-      addXP(50);
-      goldenNodeRef.current = null;
-      ate = true;
-    }
-
-    if (!ate) {
-      newSnake.pop();
-    }
-
-    snakeRef.current = newSnake;
-
-    // Update Golden Node Timer
-    if (goldenNodeRef.current) {
-      goldenNodeRef.current.timer--;
-      if (goldenNodeRef.current.timer <= 0) {
-        goldenNodeRef.current = null;
-      }
-    }
-  }, [tileCount, addXP, spawnDataNode, gameOver, spawnParticles]);
-
-  // --- Render Loop ---
-  const render = useCallback(() => {
-    const ctx = canvasRef.current?.getContext('2d');
-    if (!ctx) return;
-
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
-
-    // Grid lines
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.03)";
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= tileCount.x; i++) {
-      ctx.beginPath(); ctx.moveTo(i * GRID_SIZE, 0); ctx.lineTo(i * GRID_SIZE, canvasSize.height); ctx.stroke();
-    }
-    for (let i = 0; i <= tileCount.y; i++) {
-      ctx.beginPath(); ctx.moveTo(0, i * GRID_SIZE); ctx.lineTo(canvasSize.width, i * GRID_SIZE); ctx.stroke();
-    }
-
-    const primaryColor = getComputedStyle(document.documentElement).getPropertyValue('--color-primary').trim();
-    const primaryDimColor = getComputedStyle(document.documentElement).getPropertyValue('--color-primary-dim').trim();
-
-    // Firewalls
-    ctx.fillStyle = "#ff3131";
-    ctx.shadowBlur = 5;
-    ctx.shadowColor = "#ff3131";
-    firewallsRef.current.forEach(fw => {
-      ctx.fillRect(fw.x * GRID_SIZE + 2, fw.y * GRID_SIZE + 2, GRID_SIZE - 4, GRID_SIZE - 4);
-    });
-
-    // Data Node
-    ctx.fillStyle = "#fff";
-    ctx.shadowBlur = 15;
-    ctx.shadowColor = primaryColor;
-    ctx.fillRect(dataNodeRef.current.x * GRID_SIZE + 4, dataNodeRef.current.y * GRID_SIZE + 4, GRID_SIZE - 8, GRID_SIZE - 8);
-
-    // Golden Node
-    if (goldenNodeRef.current) {
-      ctx.fillStyle = "#fbbf24";
-      ctx.shadowColor = "#fbbf24";
-      // Pulse effect based on timer
-      const pulse = Math.abs(Math.sin(goldenNodeRef.current.timer * 0.2)) * 4;
-      ctx.fillRect(
-        goldenNodeRef.current.x * GRID_SIZE + 4 - pulse/2, 
-        goldenNodeRef.current.y * GRID_SIZE + 4 - pulse/2, 
-        GRID_SIZE - 8 + pulse, 
-        GRID_SIZE - 8 + pulse
-      );
-    }
-
-    // Snake
-    ctx.shadowBlur = 0;
-    snakeRef.current.forEach((part, i) => {
-      if (i === 0) {
-        ctx.fillStyle = playerRef.current.hasShield ? "#60a5fa" : primaryColor;
-      } else {
-        ctx.fillStyle = primaryDimColor;
-      }
-      ctx.fillRect(part.x * GRID_SIZE + 1, part.y * GRID_SIZE + 1, GRID_SIZE - 2, GRID_SIZE - 2);
-    });
-
-    // Particles
-    for (let i = particlesRef.current.length - 1; i >= 0; i--) {
-      const p = particlesRef.current[i];
-      p.x += p.vx;
-      p.y += p.vy;
-      p.life++;
-      if (p.life >= p.maxLife) {
-        particlesRef.current.splice(i, 1);
-        continue;
-      }
-      ctx.fillStyle = p.color;
-      ctx.globalAlpha = 1 - (p.life / p.maxLife);
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1.0;
-
-    renderLoopRef.current = requestAnimationFrame(render);
-  }, [canvasSize, tileCount]);
+    loopRef.current = requestAnimationFrame(gameTick);
+  }, [isRunning, isPaused, tileCount, addXP, spawnDataNode, spawnFirewalls]);
 
   useEffect(() => {
-    renderLoopRef.current = requestAnimationFrame(render);
+    loopRef.current = requestAnimationFrame(gameTick);
     return () => {
-      if (renderLoopRef.current) cancelAnimationFrame(renderLoopRef.current);
+      if (loopRef.current) cancelAnimationFrame(loopRef.current);
     };
-  }, [render]);
+  }, [gameTick]);
 
-  const startGame = () => {
-    snakeRef.current = [...INITIAL_SNAKE];
-    directionRef.current = { x: 0, y: -1 };
-    nextDirectionRef.current = { x: 0, y: -1 };
-    speedRef.current = player.baseSpeed;
-    goldenNodeRef.current = null;
-    particlesRef.current = [];
-    spawnDataNode();
-    spawnFirewalls();
-    
-    setIsRunning(true);
-    setIsPaused(false);
-    setIsMenuOpen(false);
-    setGameOverReason(null);
-    
-    if (gameLoopRef.current) clearInterval(gameLoopRef.current);
-    gameLoopRef.current = window.setInterval(gameTick, speedRef.current);
-  };
-
-  const togglePause = () => {
-    setIsPaused(prev => !prev);
-  };
-
-  const quitToMenu = () => {
-    setIsRunning(false);
-    setIsPaused(false);
-    setIsMenuOpen(true);
-    setGameOverReason("PROCESS_TERMINATED_BY_USER");
-    if (gameLoopRef.current) clearInterval(gameLoopRef.current);
-  };
-
-  // --- Input Handling ---
+  // --- Controls ---
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isRunningRef.current) {
-        togglePause();
+      if (e.key === 'Escape') {
+        if (isRunning && !gameOverMsg) setIsPaused(p => !p);
         return;
       }
 
-      if (!isRunningRef.current || isPausedRef.current) return;
-      const { x: dx, y: dy } = directionRef.current;
+      if (!isRunning || isPaused) return;
       
-      if (e.key === 'ArrowUp' && dy === 0) nextDirectionRef.current = { x: 0, y: -1 };
-      if (e.key === 'ArrowDown' && dy === 0) nextDirectionRef.current = { x: 0, y: 1 };
-      if (e.key === 'ArrowLeft' && dx === 0) nextDirectionRef.current = { x: -1, y: 0 };
-      if (e.key === 'ArrowRight' && dx === 0) nextDirectionRef.current = { x: 1, y: 0 };
-    };
-
-    let touchStartX = 0;
-    let touchStartY = 0;
-
-    const handleTouchStart = (e: TouchEvent) => {
-      touchStartX = e.changedTouches[0].screenX;
-      touchStartY = e.changedTouches[0].screenY;
-    };
-
-    const handleTouchEnd = (e: TouchEvent) => {
-      if (!isRunningRef.current || isPausedRef.current) return;
-      const touchEndX = e.changedTouches[0].screenX;
-      const touchEndY = e.changedTouches[0].screenY;
-      
-      const diffX = touchEndX - touchStartX;
-      const diffY = touchEndY - touchStartY;
-
-      if (Math.abs(diffX) > Math.abs(diffY)) {
-        if (Math.abs(diffX) > 30) {
-          changeDir(diffX > 0 ? 1 : -1, 0);
-        }
-      } else {
-        if (Math.abs(diffY) > 30) {
-          changeDir(0, diffY > 0 ? 1 : -1);
-        }
+      const dir = directionRef.current;
+      switch (e.key) {
+        case 'ArrowUp':
+        case 'w':
+        case 'W':
+          if (dir.y !== 1) nextDirectionRef.current = { x: 0, y: -1 };
+          break;
+        case 'ArrowDown':
+        case 's':
+        case 'S':
+          if (dir.y !== -1) nextDirectionRef.current = { x: 0, y: 1 };
+          break;
+        case 'ArrowLeft':
+        case 'a':
+        case 'A':
+          if (dir.x !== 1) nextDirectionRef.current = { x: -1, y: 0 };
+          break;
+        case 'ArrowRight':
+        case 'd':
+        case 'D':
+          if (dir.x !== -1) nextDirectionRef.current = { x: 1, y: 0 };
+          break;
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('touchstart', handleTouchStart, { passive: true });
-    window.addEventListener('touchend', handleTouchEnd, { passive: true });
-    
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('touchstart', handleTouchStart);
-      window.removeEventListener('touchend', handleTouchEnd);
-    };
-  }, []);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isRunning, isPaused, gameOverMsg]);
 
-  const changeDir = useCallback((x: number, y: number) => {
-    if (!isRunningRef.current || isPausedRef.current) return;
-    const { x: dx, y: dy } = directionRef.current;
-    if (x !== 0 && dx === 0) nextDirectionRef.current = { x, y: 0 };
-    if (y !== 0 && dy === 0) nextDirectionRef.current = { x: 0, y };
-  }, []);
+  // Touch Controls
+  const handleTouch = (dx: number, dy: number) => {
+    if (!isRunning || isPaused) return;
+    const dir = directionRef.current;
+    if (Math.abs(dx) > Math.abs(dy)) {
+      if (dx > 0 && dir.x !== -1) nextDirectionRef.current = { x: 1, y: 0 };
+      else if (dx < 0 && dir.x !== 1) nextDirectionRef.current = { x: -1, y: 0 };
+    } else {
+      if (dy > 0 && dir.y !== -1) nextDirectionRef.current = { x: 0, y: 1 };
+      else if (dy < 0 && dir.y !== 1) nextDirectionRef.current = { x: 0, y: -1 };
+    }
+  };
 
-  // --- Shop Actions ---
-  const buyOptimization = () => {
-    if (player.bytes >= 50) {
-      setPlayer(prev => ({ ...prev, bytes: prev.bytes - 50, baseSpeed: Math.max(80, prev.baseSpeed - 10) }));
+  // --- Actions ---
+  const startGame = () => {
+    snakeRef.current = [{ x: 10, y: 10 }];
+    directionRef.current = { x: 0, y: 0 };
+    nextDirectionRef.current = { x: 0, y: 0 };
+    goldenNodeRef.current = null;
+    glitchNodeRef.current = null;
+    particlesRef.current = [];
+    spawnFirewalls();
+    spawnDataNode();
+    setIsRunning(true);
+    setIsPaused(false);
+    setGameOverMsg(null);
+    setShowShop(false);
+  };
+
+  const exitToMenu = () => {
+    setIsRunning(false);
+    setIsPaused(false);
+    setGameOverMsg(null);
+  };
+
+  const buyUnderclock = () => {
+    if (Number(player.bytes) >= 50 && player.baseSpeed < 300) {
+      setPlayer(prev => ({ ...prev, bytes: Number(prev.bytes) - 50, baseSpeed: prev.baseSpeed + 15 }));
     }
   };
 
   const buyShield = () => {
-    if (player.bytes >= 150 && !player.hasShield) {
-      setPlayer(prev => ({ ...prev, bytes: prev.bytes - 150, hasShield: true }));
-    }
-  };
-
-  const buyWarpDrive = () => {
-    if (player.bytes >= 500 && !player.hasWarpDrive) {
-      setPlayer(prev => ({ ...prev, bytes: prev.bytes - 500, hasWarpDrive: true }));
+    if (Number(player.bytes) >= 150 && !player.hasShield) {
+      setPlayer(prev => ({ ...prev, bytes: Number(prev.bytes) - 150, hasShield: true }));
     }
   };
 
   const buyMultiplier = () => {
-    if (player.bytes >= 300) {
-      setPlayer(prev => ({ ...prev, bytes: prev.bytes - 300, multiplier: prev.multiplier + 1 }));
+    if (Number(player.bytes) >= 300) {
+      setPlayer(prev => ({ ...prev, bytes: Number(prev.bytes) - 300, multiplier: prev.multiplier + 1 }));
     }
   };
 
-  const switchTheme = (theme: Theme) => {
+  const buyWarpDrive = () => {
+    if (Number(player.bytes) >= 500 && !player.hasWarpDrive) {
+      setPlayer(prev => ({ ...prev, bytes: Number(prev.bytes) - 500, hasWarpDrive: true }));
+    }
+  };
+
+  const buyFirewallBypass = () => {
+    if (Number(player.bytes) >= 600 && !player.hasFirewallBypass) {
+      setPlayer(prev => ({ ...prev, bytes: Number(prev.bytes) - 600, hasFirewallBypass: true }));
+    }
+  };
+
+  const setTheme = (theme: Theme) => {
     setPlayer(prev => ({ ...prev, theme }));
   };
 
   const handleTitleClick = () => {
-    const newClicks = easterEggClicks + 1;
-    setEasterEggClicks(newClicks);
-    if (newClicks === 7) {
-      setPlayer(prev => ({ ...prev, bytes: prev.bytes + 777, theme: 'matrix' }));
-      spawnParticles(tileCount.x / 2, tileCount.y / 2, '#00ff00', 100);
-      setEasterEggClicks(0);
+    setTitleClicks(p => p + 1);
+    if (titleClicks + 1 === 7) {
+      setPlayer(prev => ({ ...prev, theme: 'matrix', bytes: Number(prev.bytes) + 777 }));
+      spawnParticles(CANVAS_SIZE/2/GRID_SIZE, CANVAS_SIZE/2/GRID_SIZE, '#00ff00', 100);
+      setTitleClicks(0);
     }
   };
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen p-4 select-none relative">
-      {/* --- Header Stats --- */}
-      <div className="w-full max-w-[400px] mb-4 z-20">
+    <div className="min-h-screen bg-black text-white font-mono flex flex-col items-center justify-center p-4 relative overflow-hidden">
+      <div className="crt-overlay pointer-events-none"></div>
+      
+      {/* Header Stats */}
+      <div className="w-full max-w-[400px] mb-4">
         <div className="flex justify-between items-end mb-2">
-          <div>
-            <div className="flex gap-2 mb-1">
-              <span className="stat-badge text-white font-bold">LVL {player.level}</span>
-              {player.hasShield && (
-                <motion.span initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }} className="stat-badge text-blue-400 flex items-center gap-1">
-                  <Shield size={10} /> SHIELD_ACTIVE
-                </motion.span>
-              )}
-              {player.hasWarpDrive && (
-                <span className="stat-badge text-purple-400 flex items-center gap-1"><Rocket size={10} /> WARP</span>
-              )}
-            </div>
-            <h1 onClick={handleTitleClick} className="text-sm font-bold terminal-text uppercase tracking-widest flex items-center gap-2 cursor-pointer">
-              <Terminal size={14} /> NetRunner_v3.0
-            </h1>
+          <div className="flex items-center gap-2">
+            <span className="border border-theme text-theme px-2 py-1 text-xs font-bold rounded-sm">SYS_LVL {player.level}</span>
+            {player.hasShield && (
+              <span className="stat-badge text-blue-400 flex items-center gap-1"><Shield size={10} /> PROXY</span>
+            )}
+            {player.hasWarpDrive && (
+              <span className="stat-badge text-purple-400 flex items-center gap-1"><Rocket size={10} /> WARP</span>
+            )}
+            {player.hasFirewallBypass && (
+              <span className="stat-badge text-red-400 flex items-center gap-1"><Flame size={10} /> BYPASS</span>
+            )}
           </div>
           <div className="text-right">
-            <p className="text-[10px] opacity-50 uppercase tracking-tighter">Encrypted_Bytes</p>
-            <p className="text-2xl font-bold text-yellow-500 tabular-nums">
+            <div className="text-[10px] text-theme opacity-70">ENCRYPTED_BYTES</div>
+            <div className="text-xl font-bold text-yellow-500 flex items-center gap-1 justify-end">
               {player.bytes} <span className="text-xs">B</span>
-              {player.multiplier > 1 && <span className="text-[10px] ml-1 opacity-70">x{player.multiplier}</span>}
-            </p>
+            </div>
           </div>
         </div>
         
-        <div className="relative h-1.5 bg-zinc-900 rounded-full overflow-hidden border border-white/5">
-          <motion.div 
-            className="absolute top-0 left-0 h-full bg-[var(--color-primary)] shadow-[0_0_10px_var(--color-primary)]"
-            initial={{ width: 0 }}
-            animate={{ width: `${(player.xp / (player.level * 100)) * 100}%` }}
-            transition={{ type: 'spring', stiffness: 50 }}
+        {/* XP Bar */}
+        <div className="flex justify-between text-[9px] text-gray-500 font-bold mb-1 px-1">
+          <span>PROGRESS</span>
+          <span>{Math.floor(player.xp)} / {player.level * 100} XP</span>
+        </div>
+        <div className="h-1.5 w-full bg-gray-900 rounded-full overflow-hidden border border-gray-800">
+          <div 
+            className="h-full bg-theme transition-all duration-300"
+            style={{ width: `${(player.xp / (player.level * 100)) * 100}%` }}
           />
+        </div>
+        
+        <div className="flex justify-between items-center mt-2">
+          <h1 
+            className="text-theme font-bold tracking-widest cursor-pointer select-none"
+            onClick={handleTitleClick}
+          >
+            &gt;_ NETRUNNER_V3.0
+          </h1>
+          <div className="flex items-center gap-4">
+            <div className="text-xs opacity-50 flex items-center gap-1">
+              <Star size={10} /> x{player.multiplier}
+            </div>
+            <button 
+              onClick={() => { if (isRunning && !gameOverMsg) setIsPaused(true); }}
+              className={`text-theme hover:text-white transition-colors ${(!isRunning || gameOverMsg) ? 'opacity-0 pointer-events-none' : ''}`}
+              title="Pause (ESC)"
+            >
+              <Pause size={18} />
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* --- Game Container --- */}
-      <div id="game-container" className="relative border border-white/10 shadow-2xl rounded-sm overflow-hidden bg-black">
-        <div className="crt-overlay"></div>
-        <canvas ref={canvasRef} width={canvasSize.width} height={canvasSize.height} className="block relative z-0" />
+      {/* Game Container */}
+      <div id="game-container" className="relative border-2 border-theme rounded-sm shadow-[0_0_20px_var(--theme-color)] bg-gray-950">
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_SIZE}
+          height={CANVAS_SIZE}
+          className="block"
+        />
 
-        {/* Pause Button during gameplay */}
-        {isRunning && !isMenuOpen && (
-          <button onClick={togglePause} className="absolute top-2 right-2 z-30 p-2 bg-black/50 border border-[var(--color-primary)] text-[var(--color-primary)] rounded-md hover:bg-[var(--color-primary-glow)] transition-colors">
-            <Pause size={16} />
-          </button>
+        {/* Overlays */}
+        {!isRunning && !showShop && (
+          <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center p-6 text-center backdrop-blur-sm">
+            {gameOverMsg ? (
+              <>
+                <h2 className="text-2xl font-bold text-red-500 mb-2 drop-shadow-[0_0_10px_rgba(239,68,68,0.8)]">{gameOverMsg}</h2>
+                <p className="text-xs text-gray-400 mb-6">Connection lost. Rebooting sequence required.</p>
+              </>
+            ) : (
+              <h2 className="text-2xl font-bold text-theme mb-6 drop-shadow-[0_0_10px_var(--theme-color)]">SYSTEM_READY</h2>
+            )}
+            
+            <div className="flex flex-col gap-3 w-full max-w-[200px]">
+              <button className="btn-primary flex items-center justify-center gap-2" onClick={startGame}>
+                <Play size={16} /> {gameOverMsg ? 'REBOOT' : 'INITIALIZE'}
+              </button>
+              <button className="btn-secondary flex items-center justify-center gap-2" onClick={() => setShowShop(true)}>
+                <ShoppingCart size={16} /> MARKETPLACE
+              </button>
+            </div>
+          </div>
         )}
 
-        {/* --- Pause Overlay --- */}
-        <AnimatePresence>
-          {isPaused && !isMenuOpen && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-6 z-40">
-              <h2 className="text-3xl font-black mb-8 tracking-widest terminal-text">PAUSED</h2>
-              <button onClick={togglePause} className="w-full max-w-[200px] border-2 border-[var(--color-primary)] py-3 mb-4 font-bold hover:bg-[var(--color-primary)] hover:text-black transition-all flex items-center justify-center gap-2">
+        {isPaused && (
+          <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center p-6 text-center backdrop-blur-sm z-10">
+            <h2 className="text-2xl font-bold text-yellow-500 mb-6 drop-shadow-[0_0_10px_rgba(234,179,8,0.8)]">SYSTEM_PAUSED</h2>
+            <div className="flex flex-col gap-3 w-full max-w-[200px]">
+              <button className="btn-primary flex items-center justify-center gap-2" onClick={() => setIsPaused(false)}>
                 <Play size={16} /> RESUME
               </button>
-              <button onClick={quitToMenu} className="w-full max-w-[200px] border-2 border-red-500 text-red-500 py-3 font-bold hover:bg-red-500 hover:text-black transition-all flex items-center justify-center gap-2">
-                <Home size={16} /> EXIT TO MENU
+              <button className="btn-secondary flex items-center justify-center gap-2" onClick={exitToMenu}>
+                <Home size={16} /> DISCONNECT
               </button>
-            </motion.div>
-          )}
-        </AnimatePresence>
+            </div>
+          </div>
+        )}
 
-        {/* --- Overlay Menu --- */}
-        <AnimatePresence>
-          {isMenuOpen && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-black/90 backdrop-blur-sm flex flex-col items-center justify-start p-6 z-50 overflow-y-auto custom-scrollbar">
-              <motion.h2 initial={{ y: -20 }} animate={{ y: 0 }} className="text-2xl font-black mb-6 text-center uppercase tracking-tighter terminal-text mt-4">
-                {gameOverReason || "System_Ready"}
-              </motion.h2>
+        {showShop && !isRunning && (
+          <div className="absolute inset-0 bg-black/95 p-6 flex flex-col overflow-hidden backdrop-blur-md">
+            <div className="flex justify-between items-center mb-4 border-b border-gray-800 pb-2">
+              <h2 className="text-lg font-bold text-theme flex items-center gap-2"><ShoppingCart size={18}/> MARKETPLACE</h2>
+              <button onClick={() => setShowShop(false)} className="text-gray-400 hover:text-white"><RefreshCcw size={16}/></button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-3">
+              <button onClick={buyUnderclock} disabled={Number(player.bytes) < 50 || player.baseSpeed >= 300} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${(Number(player.bytes) < 50 || player.baseSpeed >= 300) ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
+                <div>
+                  <div className="text-xs font-bold uppercase flex items-center gap-1"><Cpu size={12}/> Underclocking</div>
+                  <div className="text-[9px] opacity-60">Slower Snake (+15ms)</div>
+                </div>
+                <span className="text-yellow-500 font-bold text-sm">
+                  {player.baseSpeed >= 300 ? 'MAX' : '50 B'}
+                </span>
+              </button>
 
-              {/* Shop */}
-              <div className="w-full max-w-[300px] space-y-2 mb-6">
-                <p className="text-[10px] uppercase opacity-50 flex items-center gap-2">
-                  <ShoppingCart size={12} /> Marketplace
-                </p>
-                
-                <button onClick={buyOptimization} disabled={player.bytes < 50} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${player.bytes < 50 ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
-                  <div>
-                    <div className="text-xs font-bold uppercase flex items-center gap-1"><Cpu size={12}/> Optimization</div>
-                    <div className="text-[9px] opacity-60">Speed -10ms</div>
-                  </div>
-                  <span className="text-yellow-500 font-bold text-sm">50 B</span>
-                </button>
+              <button onClick={buyShield} disabled={Number(player.bytes) < 150 || player.hasShield} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${(Number(player.bytes) < 150 || player.hasShield) ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
+                <div>
+                  <div className="text-xs font-bold uppercase flex items-center gap-1"><Shield size={12}/> Proxy Shield</div>
+                  <div className="text-[9px] opacity-60">Absorb 1 hit</div>
+                </div>
+                <span className="text-yellow-500 font-bold text-sm">150 B</span>
+              </button>
 
-                <button onClick={buyShield} disabled={player.bytes < 150 || player.hasShield} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${(player.bytes < 150 || player.hasShield) ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
-                  <div>
-                    <div className="text-xs font-bold uppercase flex items-center gap-1"><Shield size={12}/> Proxy Shield</div>
-                    <div className="text-[9px] opacity-60">Absorb 1 hit</div>
-                  </div>
-                  <span className="text-yellow-500 font-bold text-sm">150 B</span>
-                </button>
+              <button onClick={buyMultiplier} disabled={Number(player.bytes) < 300} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${Number(player.bytes) < 300 ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
+                <div>
+                  <div className="text-xs font-bold uppercase flex items-center gap-1"><Star size={12}/> Data Multiplier</div>
+                  <div className="text-[9px] opacity-60">Bytes x{player.multiplier + 1}</div>
+                </div>
+                <span className="text-yellow-500 font-bold text-sm">300 B</span>
+              </button>
 
-                <button onClick={buyMultiplier} disabled={player.bytes < 300} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${player.bytes < 300 ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
-                  <div>
-                    <div className="text-xs font-bold uppercase flex items-center gap-1"><Star size={12}/> Data Multiplier</div>
-                    <div className="text-[9px] opacity-60">Bytes x{player.multiplier + 1}</div>
-                  </div>
-                  <span className="text-yellow-500 font-bold text-sm">300 B</span>
-                </button>
+              <button onClick={buyWarpDrive} disabled={Number(player.bytes) < 500 || player.hasWarpDrive} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${(Number(player.bytes) < 500 || player.hasWarpDrive) ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
+                <div>
+                  <div className="text-xs font-bold uppercase flex items-center gap-1"><Rocket size={12}/> Warp Drive</div>
+                  <div className="text-[9px] opacity-60">Pass through a wall once</div>
+                </div>
+                <span className="text-yellow-500 font-bold text-sm">500 B</span>
+              </button>
 
-                <button onClick={buyWarpDrive} disabled={player.bytes < 500 || player.hasWarpDrive} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${(player.bytes < 500 || player.hasWarpDrive) ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
-                  <div>
-                    <div className="text-xs font-bold uppercase flex items-center gap-1"><Rocket size={12}/> Warp Drive</div>
-                    <div className="text-[9px] opacity-60">Pass through walls</div>
-                  </div>
-                  <span className="text-yellow-500 font-bold text-sm">500 B</span>
-                </button>
-              </div>
+              <button onClick={buyFirewallBypass} disabled={Number(player.bytes) < 600 || player.hasFirewallBypass} className={`shop-item w-full p-2 flex justify-between items-center rounded-sm text-left ${(Number(player.bytes) < 600 || player.hasFirewallBypass) ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'}`}>
+                <div>
+                  <div className="text-xs font-bold uppercase flex items-center gap-1"><Flame size={12}/> Firewall Bypass</div>
+                  <div className="text-[9px] opacity-60">Eat 1 firewall for +20B</div>
+                </div>
+                <span className="text-yellow-500 font-bold text-sm">600 B</span>
+              </button>
 
-              {/* Theme Selector */}
-              <div className="w-full max-w-[300px] mb-6">
-                <p className="text-[10px] uppercase opacity-50 mb-2 flex items-center gap-2">
-                  <Palette size={12} /> Visual_Themes
-                </p>
-                <div className="flex justify-between gap-2">
-                  {(['green', 'red', 'blue', 'pink', 'purple', ...(player.theme === 'matrix' ? ['matrix'] : [])] as Theme[]).map(t => (
-                    <button
-                      key={t}
-                      onClick={() => switchTheme(t)}
-                      className={`w-8 h-8 rounded-full border-2 transition-all ${player.theme === t ? 'border-white scale-110' : 'border-transparent opacity-50 hover:opacity-100'}`}
-                      style={{ 
-                        backgroundColor: t === 'green' ? '#00ff41' : 
-                                         t === 'red' ? '#ff3131' : 
-                                         t === 'blue' ? '#3182ff' : 
-                                         t === 'pink' ? '#ff31f6' : 
-                                         t === 'purple' ? '#9b31ff' : '#00ff00'
-                      }}
+              <div className="pt-4 border-t border-gray-800">
+                <div className="text-xs font-bold mb-3 flex items-center gap-2 text-gray-400"><Palette size={14}/> VISUAL_THEMES</div>
+                <div className="flex gap-2 flex-wrap">
+                  {(['green', 'red', 'blue', 'pink', 'purple'] as Theme[]).map(t => (
+                    <button 
+                      key={t} 
+                      onClick={() => setTheme(t)}
+                      className={`w-8 h-8 rounded-full border-2 ${player.theme === t ? 'border-white scale-110' : 'border-transparent opacity-50 hover:opacity-100'}`}
+                      style={{ backgroundColor: THEME_COLORS[t] }}
                     />
                   ))}
+                  {player.theme === 'matrix' && (
+                    <button 
+                      onClick={() => setTheme('matrix')}
+                      className={`w-8 h-8 rounded-full border-2 border-white scale-110 bg-green-500 relative overflow-hidden`}
+                    >
+                      <div className="absolute inset-0 flex items-center justify-center text-[8px] text-black font-bold">01</div>
+                    </button>
+                  )}
                 </div>
               </div>
 
-              <button onClick={startGame} className="w-full max-w-[300px] border-2 border-[var(--color-primary)] py-4 font-black uppercase tracking-widest hover:bg-[var(--color-primary)] hover:text-black transition-all flex items-center justify-center gap-2 shrink-0">
-                {gameOverReason ? <RefreshCcw size={18} /> : <Play size={18} />}
-                {gameOverReason ? "Reboot_Process" : "Initialize_Sequence"}
-              </button>
-              
-              <p className="mt-4 text-[9px] opacity-30 font-mono pb-4">LOCAL_STORAGE_SYNC: ACTIVE</p>
-            </motion.div>
-          )}
-        </AnimatePresence>
+              <div className="pt-4 mt-2 border-t border-gray-800">
+                <button 
+                  onClick={() => {
+                    if (confirmReset) {
+                      localStorage.removeItem('snake_rpg_player_v4');
+                      localStorage.removeItem('snake_rpg_player_v3');
+                      localStorage.removeItem('snake_rpg_player_v2');
+                      localStorage.removeItem('snake_rpg_player');
+                      window.location.reload();
+                    } else {
+                      setConfirmReset(true);
+                      setTimeout(() => setConfirmReset(false), 3000);
+                    }
+                  }}
+                  className={`w-full p-2 text-xs font-bold uppercase tracking-widest rounded-sm border transition-colors ${confirmReset ? 'bg-red-500/20 border-red-500 text-red-500' : 'border-gray-800 text-gray-600 hover:text-red-400 hover:border-red-900/50'}`}
+                >
+                  {confirmReset ? 'CONFIRM RESET?' : 'FACTORY RESET'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* --- Mobile Controls --- */}
-      <div className="grid grid-cols-3 gap-3 mt-8 w-[200px] sm:hidden z-20">
+      {/* Mobile Controls (Visible only on small screens) */}
+      <div className="mt-6 grid grid-cols-3 gap-2 sm:hidden w-full max-w-[200px]">
         <div />
-        <button className="d-btn h-14 rounded-xl flex items-center justify-center" onClick={() => changeDir(0, -1)}>
-          <Zap size={24} className="rotate-0" />
-        </button>
+        <button className="bg-gray-900 p-4 rounded-lg active:bg-theme active:text-black border border-gray-800" onClick={() => handleTouch(0, -1)}>↑</button>
         <div />
-        <button className="d-btn h-14 rounded-xl flex items-center justify-center" onClick={() => changeDir(-1, 0)}>
-          <Zap size={24} className="-rotate-90" />
-        </button>
-        <button className="d-btn h-14 rounded-xl flex items-center justify-center" onClick={() => changeDir(0, 1)}>
-          <Zap size={24} className="rotate-180" />
-        </button>
-        <button className="d-btn h-14 rounded-xl flex items-center justify-center" onClick={() => changeDir(1, 0)}>
-          <Zap size={24} className="rotate-90" />
-        </button>
+        <button className="bg-gray-900 p-4 rounded-lg active:bg-theme active:text-black border border-gray-800" onClick={() => handleTouch(-1, 0)}>←</button>
+        <button className="bg-gray-900 p-4 rounded-lg active:bg-theme active:text-black border border-gray-800" onClick={() => handleTouch(0, 1)}>↓</button>
+        <button className="bg-gray-900 p-4 rounded-lg active:bg-theme active:text-black border border-gray-800" onClick={() => handleTouch(1, 0)}>→</button>
       </div>
 
-      {/* Desktop Hint */}
-      <p className="mt-8 text-[10px] opacity-20 hidden sm:block uppercase tracking-[0.2em]">
-        Use Arrow Keys to Navigate the Grid | ESC to Pause
-      </p>
+      <div className="mt-8 text-[10px] text-gray-600 tracking-widest uppercase hidden sm:block">
+        USE ARROW KEYS TO NAVIGATE THE GRID | ESC TO PAUSE
+      </div>
     </div>
   );
 }

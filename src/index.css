@@ -9,6 +9,8 @@
   --color-primary: #00ff41;
   --color-primary-dim: #004411;
   --color-primary-glow: rgba(0, 255, 65, 0.2);
+
+  --color-theme: var(--color-primary);
 }
 
 [data-theme="red"] {
@@ -44,6 +46,7 @@
 body {
   background-color: #020202;
   color: var(--color-primary);
+  --theme-color: var(--color-primary);
   font-family: var(--font-mono);
   overflow: hidden;
   height: 100dvh;
@@ -81,6 +84,19 @@ body {
 .shake {
   animation: shake 0.5s;
   animation-iteration-count: 1;
+}
+
+@keyframes glitch-anim {
+  0% { filter: hue-rotate(0deg) invert(0%); transform: translate(0,0); }
+  20% { filter: hue-rotate(90deg) invert(20%); transform: translate(-5px, 5px); }
+  40% { filter: hue-rotate(180deg) invert(0%); transform: translate(5px, -5px); }
+  60% { filter: hue-rotate(270deg) invert(20%); transform: translate(-5px, -5px); }
+  80% { filter: hue-rotate(360deg) invert(0%); transform: translate(5px, 5px); }
+  100% { filter: hue-rotate(0deg) invert(0%); transform: translate(0,0); }
+}
+
+.glitch-anim {
+  animation: glitch-anim 0.3s infinite;
 }
 
 .custom-scrollbar::-webkit-scrollbar {
