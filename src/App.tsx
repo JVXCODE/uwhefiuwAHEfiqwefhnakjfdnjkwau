@@ -24,9 +24,7 @@ const INITIAL_SNAKE = [{ x: 10, y: 10 }, { x: 10, y: 11 }, { x: 10, y: 12 }];
 export default function App() {
   // --- State ---
   const [player, setPlayer] = useState<PlayerState>(() => {
-    const saved = localStorage.getItem('snake_rpg_player_v3');
-    if (saved) return JSON.parse(saved);
-    return {
+    const defaultState: PlayerState = {
       level: 1,
       xp: 0,
       bytes: 0,
@@ -36,6 +34,26 @@ export default function App() {
       multiplier: 1,
       theme: 'green'
     };
+
+    const saved = localStorage.getItem('snake_rpg_player_v3');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        return {
+          ...defaultState,
+          ...parsed,
+          // Fix corrupted NaN values if they exist
+          bytes: isNaN(parsed.bytes) || parsed.bytes === null ? 0 : parsed.bytes,
+          multiplier: isNaN(parsed.multiplier) || parsed.multiplier === null ? 1 : parsed.multiplier,
+          baseSpeed: isNaN(parsed.baseSpeed) || parsed.baseSpeed === null ? 160 : parsed.baseSpeed,
+          xp: isNaN(parsed.xp) || parsed.xp === null ? 0 : parsed.xp,
+          level: isNaN(parsed.level) || parsed.level === null ? 1 : parsed.level,
+        };
+      } catch (e) {
+        return defaultState;
+      }
+    }
+    return defaultState;
   });
 
   const [isRunning, setIsRunning] = useState(false);
